@@ -1,0 +1,7 @@
+{
+  "name": "Fortuna",
+  "description": "Privacy-first financial planning app with on-device AI 'vibe checks' for your money.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}

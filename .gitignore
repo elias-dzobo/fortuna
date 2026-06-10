@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+.pnp/
+.venv/
+venv/
+env/
+.expo/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Native build output
+ios/Pods/
+ios/build/
+android/build/
+android/.gradle/
+*.xcworkspace/xcuserdata/
+
+# Builds
+dist/
+build/
+out/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+.xcode.env
+*.pem
+*.key
+*.keystore
+
+# Models & large binaries (kept on disk, excluded from repo)
+*.pte
+*.safetensors
+*.gguf
+*.bin
+*.onnx
+*.pt
+model_server/*.pte
+Models/*.pte
+
+# Local data & archives
+data/
+*.zip
+
+# Logs & OS
+*.log
+.DS_Store
