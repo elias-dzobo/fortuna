@@ -7,18 +7,30 @@
 //
 
 import Foundation
-// NOTE: Uncomment when ExecuTorch is added to the project via SPM
-// import ExecuTorch
-// import LLaMARunner
+// REQUIRED: add the ExecuTorch Swift package via SPM, then these resolve.
+// The LLaMA text runner ships in ExecuTorch's `extension/llm/apple` target.
+// (Symbol names track the upstream LLaMA demo app; if your ExecuTorch version
+//  renamed `Runner`, adjust the typealias below — that's the only touch point.)
+import ExecuTorchLLM
+
+/// The ExecuTorch text-generation runner. Aliased so the rest of this file is
+/// insulated from upstream renames across ExecuTorch versions.
+private typealias LLMRunner = TextRunner
 
 /// Service for managing Fortuna's on-device LLM model
 class FortunaModelService {
-    
+
     // MARK: - Properties
-    
-    // NOTE: These types come from ExecuTorch - uncomment when package is added
-    // private var runner: LLaMARunner?
+
+    private var runner: LLMRunner?
     private var isLoaded = false
+
+    /// How long the last `loadModel` took (ms). Feeds the benchmark harness.
+    private(set) var lastLoadTimeMs: Double = 0
+    /// Size on disk of the currently loaded model (MB) — eq. 1 input.
+    private(set) var loadedModelSizeMB: Double = 0
+    /// Metrics from the most recent generation. Read this after `generate(...)`.
+    private(set) var lastBenchmark: BenchmarkResult?
     
     /// Model quantization level
     enum Quantization: String {
@@ -85,29 +97,29 @@ class FortunaModelService {
     /// Load model from a specific file path
     private func loadModelFromPath(_ path: String) throws {
         print("📱 Loading Fortuna model from: \(path)")
-        
-        // Find tokenizer path
-        guard let tokenizerPath = Bundle.main.path(
-            forResource: "tokenizer",
-            ofType: "model"
-        ) else {
-            throw ModelError.tokenizerNotFound
-        }
-        
+
+        // Qwen3 ships a HF BPE tokenizer (tokenizer.json). Older SentencePiece
+        // exports use tokenizer.model — try json first, fall back to model.
+        let tokenizerPath = Bundle.main.path(forResource: "tokenizer", ofType: "json")
+            ?? Bundle.main.path(forResource: "tokenizer", ofType: "model")
+        guard let tokenizerPath else { throw ModelError.tokenizerNotFound }
         print("📝 Loading tokenizer from: \(tokenizerPath)")
-        
-        // NOTE: Actual ExecuTorch initialization
-        // Uncomment when ExecuTorch is added to project:
-        /*
-        runner = try LLaMARunner(
-            modelPath: path,
-            tokenizerPath: tokenizerPath
-        )
-        */
-        
-        // For now, mark as loaded (placeholder)
-        isLoaded = true
-        print("✅ Model loaded successfully")
+
+        // --- Construct + load the runner, timing the load. ---
+        // Load time is mostly mmap + backend init; we record it so startup cost
+        // is a tracked metric, not a mystery.
+        let t0 = DispatchTime.now()
+        let runner = LLMRunner(modelPath: path, tokenizerPath: tokenizerPath)
+        try runner.load()
+        let t1 = DispatchTime.now()
+
+        self.runner = runner
+        self.lastLoadTimeMs = Double(t1.uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000.0
+        self.loadedModelSizeMB = (try? FileManager.default
+            .attributesOfItem(atPath: path)[.size] as? NSNumber)?.doubleValue
+            .map { $0 / 1_048_576.0 } ?? 0
+        self.isLoaded = true
+        print(String(format: "✅ Model loaded in %.0f ms (%.0f MB)", lastLoadTimeMs, loadedModelSizeMB))
     }
     
     /// Automatically selects optimal quantization based on device
@@ -134,31 +146,9 @@ class FortunaModelService {
         maxTokens: Int = 256,
         temperature: Float = 0.7
     ) async throws -> String {
-        guard isLoaded else {
-            throw ModelError.modelNotLoaded
-        }
-        
-        // NOTE: Actual ExecuTorch generation
-        // Uncomment when ExecuTorch is added:
-        /*
-        guard let runner = runner else {
-            throw ModelError.modelNotLoaded
-        }
-        
-        let response = try await runner.generate(
-            prompt: prompt,
-            maxNewTokens: maxTokens,
-            temperature: temperature,
-            topP: 0.9
-        )
-        
-        return response
-        */
-        
-        // Placeholder response for testing without ExecuTorch
-        return generateMockResponse(for: prompt)
+        try await runGenerate(prompt: prompt, maxTokens: maxTokens, onToken: { _ in })
     }
-    
+
     /// Generates streaming tokens (callback for each token)
     func generateStreaming(
         prompt: String,
@@ -166,36 +156,71 @@ class FortunaModelService {
         temperature: Float = 0.7,
         onToken: @escaping (String) -> Void
     ) async throws -> String {
-        guard isLoaded else {
-            throw ModelError.modelNotLoaded
-        }
-        
-        // NOTE: Actual streaming generation
-        // Uncomment when ExecuTorch is added:
-        /*
-        guard let runner = runner else {
-            throw ModelError.modelNotLoaded
-        }
-        
-        var fullResponse = ""
-        
-        try await runner.generate(
-            prompt: prompt,
-            maxNewTokens: maxTokens,
-            temperature: temperature,
-            onToken: { token in
-                fullResponse += token
-                onToken(token)
-            }
+        try await runGenerate(prompt: prompt, maxTokens: maxTokens, onToken: onToken)
+    }
+
+    // MARK: - Instrumented generation (the one real code path)
+
+    /// The single place generation actually happens. Every call is measured by
+    /// the BenchmarkRecorder, so you can never run inference without metrics.
+    ///
+    /// The key first-principles move is in the token callback: the FIRST token
+    /// marks the prefill→decode boundary (TTFT). Everything after is decode,
+    /// which is bandwidth-bound. The recorder keeps those windows separate.
+    private func runGenerate(
+        prompt: String,
+        maxTokens: Int,
+        onToken: @escaping (String) -> Void
+    ) async throws -> String {
+        guard isLoaded, let runner else { throw ModelError.modelNotLoaded }
+
+        let rec = BenchmarkRecorder(
+            label: "qwen3-0.6b",
+            modelSizeMB: loadedModelSizeMB,
+            loadTimeMs: lastLoadTimeMs
         )
-        
-        return fullResponse
-        */
-        
-        // Placeholder for testing
-        let response = generateMockResponse(for: prompt)
-        onToken(response)
-        return response
+        // We don't have a cheap token count for the prompt here; prefill latency
+        // (TTFT) is still measured correctly. Fill promptTokens from runner stats
+        // in Phase 1 once we expose the tokenizer. For now report characters→0.
+        rec.start(promptTokens: 0)
+
+        // ExecuTorch's runner is synchronous and blocks the calling thread while
+        // it streams tokens. Run it off the main actor and bridge back via a
+        // continuation so callers keep their async/await ergonomics.
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var full = ""
+                do {
+                    // VERSION-SENSITIVE TOUCH POINT (the only other one besides the
+                    // typealias): match this signature to your ExecuTorch version.
+                    // Classic demo shape: generate(_:sequenceLength:tokenCallback:).
+                    try runner.generate(prompt, sequenceLength: maxTokens) { token in
+                        rec.recordToken()          // first call = TTFT; rest = decode
+                        full += token
+                        onToken(token)
+                    }
+                    let result = rec.finish()
+                    self.lastBenchmark = result
+                    print(result.markdownRow)      // paste into LEARNING_ROADMAP.md
+                    continuation.resume(returning: full)
+                } catch {
+                    continuation.resume(throwing: ModelError.inferenceFailed("\(error)"))
+                }
+            }
+        }
+    }
+
+    /// Convenience: run a fixed prompt and return just the metrics. Use this to
+    /// produce a clean, comparable benchmark row across builds (Phase 0+).
+    func benchmark(
+        prompt: String = "Give me one quick tip to start saving money.",
+        maxTokens: Int = 128
+    ) async throws -> BenchmarkResult {
+        _ = try await generate(prompt: prompt, maxTokens: maxTokens)
+        guard let result = lastBenchmark else {
+            throw ModelError.inferenceFailed("no benchmark captured")
+        }
+        return result
     }
     
     /// Generates a Financial Vibe profile based on user data
@@ -282,48 +307,11 @@ class FortunaModelService {
         """
     }
     
-    // MARK: - Mock Responses (for testing without ExecuTorch)
-    
-    /// Generates a mock response for testing
-    private func generateMockResponse(for prompt: String) -> String {
-        // Extract the user message from the formatted prompt
-        let lowercased = prompt.lowercased()
-        
-        if lowercased.contains("laptop") || lowercased.contains("buy") || lowercased.contains("purchase") {
-            return "Before making that purchase, let's make sure your emergency fund is solid! " +
-                   "Do you have at least 3 months of expenses saved? If not, maybe hold off for a bit. 💰"
-        } else if lowercased.contains("debt") || lowercased.contains("pay off") || lowercased.contains("credit card") {
-            return "Smart thinking on tackling debt! Focus on the highest interest rate first - " +
-                   "that's usually credit cards. Even small extra payments make a big difference! 📈"
-        } else if lowercased.contains("save") || lowercased.contains("saving") || lowercased.contains("emergency") {
-            return "Building your savings is a great move! Try the 50/30/20 rule - " +
-                   "50% needs, 30% wants, 20% savings. Start small and stay consistent! 🎯"
-        } else if lowercased.contains("invest") || lowercased.contains("stocks") {
-            return "Love the investing mindset! But first, make sure you have an emergency fund. " +
-                   "Then consider starting with low-cost index funds. Time in market > timing the market! 📊"
-        } else if lowercased.contains("budget") {
-            return "Budgeting doesn't have to be boring! Track your spending for a week first, " +
-                   "then set realistic limits. Apps can help automate this! 📱"
-        } else if lowercased.contains("vibe") && lowercased.contains("json") {
-            return """
-            {
-                "primaryVibe": "Glow Up in Progress",
-                "riskProfile": "Calculated Risk-Taker",
-                "summary": "You're on your way up! Building solid habits and starting to see the rewards. Keep that momentum going!",
-                "priorities": ["Build emergency fund", "Pay off high-interest debt", "Start investing basics"]
-            }
-            """
-        } else {
-            return "I'm here to help with your money questions! " +
-                   "Ask me about budgeting, saving, debt, or any financial decisions you're thinking about. 💚"
-        }
-    }
-    
     // MARK: - Memory Management
     
     /// Unloads the model from memory
     func unload() {
-        // runner = nil
+        runner = nil
         isLoaded = false
         print("🗑️ Model unloaded")
     }
